@@ -198,11 +198,14 @@ def sync_blocks():
             coinstake = block.stake and index == 1
             indexes = {}
 
-            transaction = TransactionService.create(
-                utils.amount(tx_data["amount"]), tx_data["txid"],
-                created, tx_data["locktime"], tx_data["size"], block,
-                coinbase, coinstake
-            )
+            if not (transaction := TransactionService.get_by_txid(txid=tx_data["txid"])):
+                transaction = TransactionService.create(
+                    utils.amount(tx_data["amount"]), tx_data["txid"],
+                    created, tx_data["locktime"], tx_data["size"], block,
+                    coinbase, coinstake
+                )
+
+            transaction.block = block
 
             for vin in tx_data["vin"]:
                 if "coinbase" in vin:
@@ -214,6 +217,9 @@ def sync_blocks():
                 prev_out.address.transactions.add(transaction)
                 balance = BalanceService.get_by_currency(prev_out.address, prev_out.currency)
                 balance.balance -= prev_out.amount
+
+                if InputService.get_by_transaction(transaction=transaction):
+                    continue
 
                 InputService.create(
                     vin["sequence"], vin["vout"], transaction, prev_out
@@ -275,3 +281,68 @@ def sync_blocks():
 
         latest_block = block
         orm.commit()
+
+@orm.db_session
+def sync_mempool():
+    mempool = General.mempool()['result']
+
+    for tx in mempool['tx']:
+        tx_data = Transaction.info(tx, False)['result']
+        created = datetime.fromtimestamp(tx_data['timestamp'])
+        if not (transaction := TransactionService.get_by_txid(tx_data['txid'])):
+            print(f"adding mempool tx {tx} to db")
+            transaction = TransactionService.create(
+                utils.amount(tx_data['amount']), tx_data['txid'],
+                created, tx_data['locktime'], tx_data['size']
+            )
+
+        for vin in tx_data["vin"]:
+            if "coinbase" in vin:
+                continue
+
+            prev_tx = TransactionService.get_by_txid(vin["txid"])
+            prev_out = OutputService.get_by_prev(prev_tx, vin["vout"])
+
+            prev_out.address.transactions.add(transaction)
+            balance = BalanceService.get_by_currency(prev_out.address, prev_out.currency)
+            balance.balance -= prev_out.amount
+
+            if InputService.get_by_transaction(transaction=transaction):
+                continue
+
+            InputService.create(
+                vin["sequence"], vin["vout"], transaction, prev_out
+            )
+
+        for vout in tx_data["vout"]:
+            if vout["scriptPubKey"]["type"] in ["nonstandard", "nulldata"]:
+                continue
+
+            amount = utils.amount(vout["valueSat"])
+            currency = "AOK"
+            timelock = 0
+
+            if "token" in vout["scriptPubKey"]:
+                timelock = vout["scriptPubKey"]["token"]["token_lock_time"]
+                currency = vout["scriptPubKey"]["token"]["name"]
+                amount = vout["scriptPubKey"]["token"]["amount"]
+
+            if "timelock" in vout["scriptPubKey"]:
+                timelock = vout["scriptPubKey"]["timelock"]
+
+            script = vout["scriptPubKey"]["addresses"][0]
+            address = AddressService.get_by_address(script)
+
+            if not address:
+                address = AddressService.create(script)
+
+            address.transactions.add(transaction)
+
+            OutputService.create(
+                transaction, amount, vout["scriptPubKey"]["type"],
+                address, vout["scriptPubKey"]["hex"],
+                vout["n"], currency,
+                timelock
+            )
+
+    pass

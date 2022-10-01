@@ -11,7 +11,7 @@ import config
 #     db=config.db["db"]
 # )
 
-db = orm.Database(**config.db_params)
+db = orm.Database(**config.db)
 
 class Token(db.Entity):
     _table_ = "chain_tokens"
@@ -77,7 +77,7 @@ class Transaction(db.Entity):
     locktime = orm.Required(int)
     size = orm.Required(int)
 
-    block = orm.Required("Block")
+    block = orm.Optional("Block")
     outputs = orm.Set("Output")
     inputs = orm.Set("Input")
 

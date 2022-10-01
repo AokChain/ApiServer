@@ -52,7 +52,7 @@ class TransactionService(object):
         return Transaction.get(txid=txid)
 
     @classmethod
-    def create(cls, amount, txid, created, locktime, size, block,
+    def create(cls, amount, txid, created, locktime, size, block=None,
                coinbase=False, coinstake=False):
         return Transaction(
             amount=amount, txid=txid, created=created,
@@ -78,6 +78,10 @@ class InputService(object):
             sequence=sequence, transaction=transaction,
             vout=vout, n=n,
         )
+
+    @classmethod
+    def get_by_transaction(cls, transaction):
+        return Input.get(transaction=transaction)
 
 class AddressService(object):
     @classmethod
