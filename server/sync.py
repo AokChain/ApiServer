@@ -249,12 +249,15 @@ def sync_blocks():
 
                 address.transactions.add(transaction)
 
-                output = OutputService.create(
-                    transaction, amount, vout["scriptPubKey"]["type"],
-                    address, vout["scriptPubKey"]["hex"],
-                    vout["n"], currency,
-                    timelock
-                )
+                if not(output := OutputService.get_by_prev(transaction=transaction, n=vout["n"])):
+                    output = OutputService.create(
+                        transaction, amount, vout["scriptPubKey"]["type"],
+                        address, vout["scriptPubKey"]["hex"],
+                        vout["n"], currency,
+                        timelock
+                    )
+
+                transaction.outputs.add(output)
 
                 balance = BalanceService.get_by_currency(address, currency)
 
@@ -338,11 +341,15 @@ def sync_mempool():
 
             address.transactions.add(transaction)
 
-            OutputService.create(
-                transaction, amount, vout["scriptPubKey"]["type"],
-                address, vout["scriptPubKey"]["hex"],
-                vout["n"], currency,
-                timelock
-            )
+            if not (output := OutputService.get_by_prev(transaction=transaction, n=vout["n"])):
+                OutputService.create(
+                    transaction, amount, vout["scriptPubKey"]["type"],
+                    address, vout["scriptPubKey"]["hex"],
+                    vout["n"], currency,
+                    timelock
+                )
+                continue
+
+            transaction.outputs.add(output)
 
     pass
