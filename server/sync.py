@@ -350,6 +350,13 @@ def sync_mempool():
                 )
                 continue
 
+            if output.spent:
+                for tx_output in transaction.outputs:
+                    tx_output.delete()
+
+                transaction.delete()
+                continue
+
             transaction.outputs.add(output)
 
     pass
