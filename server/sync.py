@@ -336,11 +336,6 @@ def sync_mempool():
             script = vout["scriptPubKey"]["addresses"][0]
             address = AddressService.get_by_address(script)
 
-            if not address:
-                address = AddressService.create(script)
-
-            address.transactions.add(transaction)
-
             if not (output := OutputService.get_by_prev(transaction=transaction, n=vout["n"])):
                 OutputService.create(
                     transaction, amount, vout["scriptPubKey"]["type"],
@@ -357,6 +352,8 @@ def sync_mempool():
                 transaction.delete()
                 continue
 
-            transaction.outputs.add(output)
+            if not address:
+                address = AddressService.create(script)
 
-    pass
+            address.transactions.add(transaction)
+            transaction.outputs.add(output)
