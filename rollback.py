@@ -55,13 +55,8 @@ def rollback(target_height):
     steps = [
         (
             "Clearing self-references in blocks to be deleted",
-            "UPDATE chain_blocks SET previous_block = NULL, "
-            f"next_block = NULL WHERE height > {target_height}",
-        ),
-        (
-            "Clearing next_block on kept tip",
-            "UPDATE chain_blocks SET next_block = NULL "
-            f"WHERE height = {target_height}",
+            "UPDATE chain_blocks SET previous_block = NULL "
+            f"WHERE height > {target_height}",
         ),
         (
             "Deleting inputs",
