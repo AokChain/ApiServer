@@ -147,6 +147,172 @@ def sync_tokens():
                 # ToDo: Update IPFS (?)
 
 
+def process_transaction(tx_data, block, index):
+    """Persist a transaction and its inputs/outputs into the DB.
+
+    If a vin references a parent tx that is not in the DB, recursively
+    fetch it from the node via load_missing_transaction.
+    """
+    txid = tx_data["txid"]
+
+    existing = TransactionService.get_by_txid(txid)
+    if existing:
+        return existing
+
+    created = datetime.fromtimestamp(tx_data["time"])
+    coinbase = block.stake is False and index == 0
+    coinstake = block.stake and index == 1
+    indexes = {}
+
+    transaction = TransactionService.create(
+        utils.amount(tx_data["amount"]),
+        tx_data["txid"],
+        created,
+        tx_data["locktime"],
+        tx_data["size"],
+        block,
+        coinbase,
+        coinstake,
+    )
+
+    for vin in tx_data["vin"]:
+        if "coinbase" in vin:
+            continue
+
+        prev_tx = TransactionService.get_by_txid(vin["txid"])
+
+        if prev_tx is None:
+            log_message(
+                f"MISSING prev tx: txid={vin['txid']} "
+                f"vout={vin['vout']} consumed by {tx_data['txid']} "
+                f"at height {block.height}; loading from node"
+            )
+            prev_tx = load_missing_transaction(vin["txid"])
+
+        prev_out = OutputService.get_by_prev(prev_tx, vin["vout"])
+
+        prev_out.address.transactions.add(transaction)
+        balance = BalanceService.get_by_currency(
+            prev_out.address, prev_out.currency
+        )
+        balance.balance -= prev_out.amount
+
+        InputService.create(
+            vin["sequence"], vin["vout"], transaction, prev_out
+        )
+
+    for vout in tx_data["vout"]:
+        if vout["scriptPubKey"]["type"] in ["nonstandard", "nulldata"]:
+            continue
+
+        amount = utils.amount(vout["valueSat"])
+        currency = "AOK"
+        timelock = 0
+
+        if "token" in vout["scriptPubKey"]:
+            timelock = vout["scriptPubKey"]["token"]["token_lock_time"]
+            currency = vout["scriptPubKey"]["token"]["name"]
+            amount = vout["scriptPubKey"]["token"]["amount"]
+
+        if "timelock" in vout["scriptPubKey"]:
+            timelock = vout["scriptPubKey"]["timelock"]
+
+        script = vout["scriptPubKey"]["addresses"][0]
+        address = AddressService.get_by_address(script)
+
+        if not address:
+            address = AddressService.create(script)
+
+        address.transactions.add(transaction)
+
+        output = OutputService.create(
+            transaction,
+            amount,
+            vout["scriptPubKey"]["type"],
+            address,
+            vout["scriptPubKey"]["hex"],
+            vout["n"],
+            currency,
+            timelock,
+        )
+
+        balance = BalanceService.get_by_currency(address, currency)
+
+        if not balance:
+            balance = BalanceService.create(address, currency)
+
+        balance.balance += output.amount
+
+        if output.currency not in indexes:
+            indexes[output.currency] = 0
+
+        indexes[output.currency] += output.amount
+
+    for currency in indexes:
+        if TransactionIndex.get(
+            currency=currency, transaction=transaction
+        ):
+            continue
+
+        TransactionIndex(
+            **{
+                "created": transaction.created,
+                "amount": indexes[currency],
+                "transaction": transaction,
+                "currency": currency,
+            }
+        )
+
+    return transaction
+
+
+def load_missing_transaction(txid):
+    """Fetch a missing transaction from the node and persist it.
+
+    The transaction's containing block must already be in the DB. If a
+    parent tx is also missing, this recurses.
+    """
+    response = Transaction.info(txid, False)
+
+    if response["error"] is not None:
+        raise RuntimeError(
+            f"Node error fetching tx {txid}: {response['error']}"
+        )
+
+    tx_data = response["result"]
+    blockhash = tx_data.get("blockhash")
+
+    if not blockhash:
+        raise RuntimeError(
+            f"Missing tx {txid} is not confirmed on node"
+        )
+
+    block = BlockService.get_by_hash(blockhash)
+
+    if block is None:
+        block_data = make_request("getblock", [blockhash])["result"]
+        raise RuntimeError(
+            f"Cannot recover tx {txid}: containing block {blockhash} "
+            f"(height {block_data['height']}) is not in the DB. "
+            f"Roll back to height {block_data['height'] - 1} or earlier."
+        )
+
+    block_data = make_request("getblock", [blockhash])["result"]
+    tx_index = block_data["tx"].index(txid)
+
+    if block.stake and tx_index == 0:
+        raise RuntimeError(
+            f"Tx {txid} is the coinstake placeholder of block "
+            f"{blockhash}; not loadable"
+        )
+
+    log_message(
+        f"Loading missing tx {txid} into block height={block.height}"
+    )
+
+    return process_transaction(tx_data, block, tx_index)
+
+
 @orm.db_session
 def sync_blocks():
     if not BlockService.latest_block():
@@ -229,109 +395,7 @@ def sync_blocks():
                 continue
 
             tx_data = Transaction.info(txid, False)["result"]
-            created = datetime.fromtimestamp(tx_data["time"])
-            coinbase = block.stake is False and index == 0
-            coinstake = block.stake and index == 1
-            indexes = {}
-
-            transaction = TransactionService.create(
-                utils.amount(tx_data["amount"]),
-                tx_data["txid"],
-                created,
-                tx_data["locktime"],
-                tx_data["size"],
-                block,
-                coinbase,
-                coinstake,
-            )
-
-            for vin in tx_data["vin"]:
-                if "coinbase" in vin:
-                    continue
-
-                prev_tx = TransactionService.get_by_txid(vin["txid"])
-
-                if prev_tx is None:
-                    log_message(
-                        f"MISSING prev tx: txid={vin['txid']} "
-                        f"vout={vin['vout']} consumed by {tx_data['txid']} "
-                        f"at height {block.height}"
-                    )
-                    raise SystemExit
-
-                prev_out = OutputService.get_by_prev(prev_tx, vin["vout"])
-
-                prev_out.address.transactions.add(transaction)
-                balance = BalanceService.get_by_currency(
-                    prev_out.address, prev_out.currency
-                )
-                balance.balance -= prev_out.amount
-
-                InputService.create(
-                    vin["sequence"], vin["vout"], transaction, prev_out
-                )
-
-            for vout in tx_data["vout"]:
-                if vout["scriptPubKey"]["type"] in ["nonstandard", "nulldata"]:
-                    continue
-
-                amount = utils.amount(vout["valueSat"])
-                currency = "AOK"
-                timelock = 0
-
-                if "token" in vout["scriptPubKey"]:
-                    timelock = vout["scriptPubKey"]["token"]["token_lock_time"]
-                    currency = vout["scriptPubKey"]["token"]["name"]
-                    amount = vout["scriptPubKey"]["token"]["amount"]
-
-                if "timelock" in vout["scriptPubKey"]:
-                    timelock = vout["scriptPubKey"]["timelock"]
-
-                script = vout["scriptPubKey"]["addresses"][0]
-                address = AddressService.get_by_address(script)
-
-                if not address:
-                    address = AddressService.create(script)
-
-                address.transactions.add(transaction)
-
-                output = OutputService.create(
-                    transaction,
-                    amount,
-                    vout["scriptPubKey"]["type"],
-                    address,
-                    vout["scriptPubKey"]["hex"],
-                    vout["n"],
-                    currency,
-                    timelock,
-                )
-
-                balance = BalanceService.get_by_currency(address, currency)
-
-                if not balance:
-                    balance = BalanceService.create(address, currency)
-
-                balance.balance += output.amount
-
-                if output.currency not in indexes:
-                    indexes[output.currency] = 0
-
-                indexes[output.currency] += output.amount
-
-            for currency in indexes:
-                if TransactionIndex.get(
-                    currency=currency, transaction=transaction
-                ):
-                    continue
-
-                TransactionIndex(
-                    **{
-                        "created": transaction.created,
-                        "amount": indexes[currency],
-                        "transaction": transaction,
-                        "currency": currency,
-                    }
-                )
+            process_transaction(tx_data, block, index)
 
         latest_block = block
         orm.commit()
