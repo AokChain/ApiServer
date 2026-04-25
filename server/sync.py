@@ -250,6 +250,15 @@ def sync_blocks():
                     continue
 
                 prev_tx = TransactionService.get_by_txid(vin["txid"])
+
+                if prev_tx is None:
+                    log_message(
+                        f"MISSING prev tx: txid={vin['txid']} "
+                        f"vout={vin['vout']} consumed by {tx_data['txid']} "
+                        f"at height {block.height}"
+                    )
+                    raise SystemExit
+
                 prev_out = OutputService.get_by_prev(prev_tx, vin["vout"])
 
                 prev_out.address.transactions.add(transaction)
