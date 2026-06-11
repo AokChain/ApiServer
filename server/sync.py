@@ -17,6 +17,10 @@ from .models import IPFSCache
 
 from .utils import make_request
 from .models import Token
+from .models import db
+
+
+REORG_DEPTH = 500
 
 
 def log_block(message, block, tx=[]):
@@ -313,6 +317,123 @@ def load_missing_transaction(txid):
     return process_transaction(tx_data, block, tx_index)
 
 
+def rollback_to_height(target_height):
+    """Bulk-delete every block above target_height and recompute balances.
+
+    Bypasses Pony's per-row before_delete hooks (which would update each
+    balance incrementally) in favor of a single balance recomputation
+    pass at the end -- orders of magnitude faster for large rollbacks.
+
+    The caller owns the surrounding db_session and the commit.
+    """
+    block_ids = (
+        f"(SELECT id FROM chain_blocks WHERE height > {target_height})"
+    )
+    tx_ids = (
+        f"(SELECT id FROM chain_transactions WHERE block IN {block_ids})"
+    )
+
+    steps = [
+        (
+            "Clearing self-references in blocks to be deleted",
+            "UPDATE chain_blocks SET previous_block = NULL "
+            f"WHERE height > {target_height}",
+        ),
+        (
+            "Deleting inputs",
+            f"DELETE FROM chain_inputs WHERE transaction IN {tx_ids}",
+        ),
+        (
+            "Deleting outputs",
+            f"DELETE FROM chain_outputs WHERE transaction IN {tx_ids}",
+        ),
+        (
+            "Deleting transaction indexes",
+            "DELETE FROM chain_transaction_index "
+            f"WHERE transaction IN {tx_ids}",
+        ),
+        (
+            "Deleting address<->transaction m2m",
+            "DELETE FROM chain_address_transactions "
+            f"WHERE transaction IN {tx_ids}",
+        ),
+        (
+            "Deleting transactions",
+            f"DELETE FROM chain_transactions WHERE block IN {block_ids}",
+        ),
+        (
+            "Deleting blocks",
+            f"DELETE FROM chain_blocks WHERE height > {target_height}",
+        ),
+        (
+            "Recomputing balances from unspent outputs",
+            "UPDATE chain_address_balance b SET balance = ("
+            "  SELECT COALESCE(SUM(o.amount), 0) FROM chain_outputs o"
+            "  WHERE o.address = b.address"
+            "  AND o.currency = b.currency"
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM chain_inputs i WHERE i.vout = o.id"
+            "  )"
+            ")",
+        ),
+    ]
+
+    for label, sql in steps:
+        log_message(label)
+        start = datetime.now()
+        db.execute(sql)
+        elapsed = (datetime.now() - start).total_seconds()
+        log_message(f"  done in {elapsed:.1f}s")
+
+
+def find_reorg_height(tip_height, node_height):
+    """Lowest height in the last REORG_DEPTH blocks whose stored hash
+    disagrees with the node, or None if the DB matches the node.
+
+    Only heights the node actually has (<= node_height) are compared, and
+    the whole window is fetched in one batched RPC. If the node fails to
+    answer for any height in the window the scan is abandoned (returns
+    None) -- so a node that is merely behind or briefly unreachable can
+    never trigger a rollback.
+    """
+    ceiling = min(tip_height, node_height)
+
+    if ceiling < 1:
+        return None
+
+    floor = max(1, ceiling - REORG_DEPTH + 1)
+
+    node_hashes = Block.blockhashes(floor, ceiling)
+
+    if len(node_hashes) != ceiling - floor + 1:
+        log_message(
+            "Skipping reorg check: node did not return all hashes for "
+            f"{floor}..{ceiling}"
+        )
+        return None
+
+    db_hashes = dict(
+        orm.select(
+            (b.height, b.blockhash)
+            for b in Block
+            if b.height >= floor and b.height <= ceiling
+        )
+    )
+
+    for height in range(floor, ceiling + 1):
+        if db_hashes.get(height) != node_hashes[height]:
+            if height == floor and floor > 1:
+                log_message(
+                    "Reorg reaches the bottom of the scan window; it may "
+                    f"be deeper than {REORG_DEPTH} blocks and will keep "
+                    "unwinding on subsequent cycles"
+                )
+
+            return height
+
+    return None
+
+
 @orm.db_session
 def sync_blocks():
     if not BlockService.latest_block():
@@ -348,14 +469,23 @@ def sync_blocks():
         f"Current node height: {current_height}, db height: {latest_block.height}"
     )
 
-    while latest_block.blockhash != Block.blockhash(latest_block.height):
-        log_block("Found reorg", latest_block)
+    reorg_height = find_reorg_height(latest_block.height, current_height)
 
-        reorg_block = latest_block
-        latest_block = reorg_block.previous_block
+    if reorg_height is not None:
+        target = reorg_height - 1
 
-        reorg_block.delete()
+        log_message(
+            f"Found reorg at height {reorg_height} "
+            f"(db tip {latest_block.height}); rolling back to {target} "
+            f"({latest_block.height - target} blocks)"
+        )
+
+        rollback_to_height(target)
         orm.commit()
+
+        # Resume forward sync on the next cycle with a fresh session so we
+        # never read Pony-cached objects invalidated by the bulk delete.
+        return
 
     # Quick hack to prevent memory overload
     next_height = current_height + 1

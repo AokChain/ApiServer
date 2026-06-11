@@ -12,8 +12,8 @@ Usage:
 """
 
 from server.services import BlockService
+from server.sync import rollback_to_height
 from server.sync import log_message
-from server.models import db
 from datetime import datetime
 from pony import orm
 import sys
@@ -45,67 +45,9 @@ def rollback(target_height):
         f"({latest.height - target_height} blocks)"
     )
 
-    block_ids = (
-        f"(SELECT id FROM chain_blocks WHERE height > {target_height})"
-    )
-    tx_ids = (
-        f"(SELECT id FROM chain_transactions WHERE block IN {block_ids})"
-    )
-
-    steps = [
-        (
-            "Clearing self-references in blocks to be deleted",
-            "UPDATE chain_blocks SET previous_block = NULL "
-            f"WHERE height > {target_height}",
-        ),
-        (
-            "Deleting inputs",
-            f"DELETE FROM chain_inputs WHERE transaction IN {tx_ids}",
-        ),
-        (
-            "Deleting outputs",
-            f"DELETE FROM chain_outputs WHERE transaction IN {tx_ids}",
-        ),
-        (
-            "Deleting transaction indexes",
-            "DELETE FROM chain_transaction_index "
-            f"WHERE transaction IN {tx_ids}",
-        ),
-        (
-            "Deleting address<->transaction m2m",
-            "DELETE FROM chain_address_transactions "
-            f"WHERE transaction IN {tx_ids}",
-        ),
-        (
-            "Deleting transactions",
-            f"DELETE FROM chain_transactions WHERE block IN {block_ids}",
-        ),
-        (
-            "Deleting blocks",
-            f"DELETE FROM chain_blocks WHERE height > {target_height}",
-        ),
-        (
-            "Recomputing balances from unspent outputs",
-            "UPDATE chain_address_balance b SET balance = ("
-            "  SELECT COALESCE(SUM(o.amount), 0) FROM chain_outputs o"
-            "  WHERE o.address = b.address"
-            "  AND o.currency = b.currency"
-            "  AND NOT EXISTS ("
-            "    SELECT 1 FROM chain_inputs i WHERE i.vout = o.id"
-            "  )"
-            ")",
-        ),
-    ]
-
     overall_start = datetime.now()
 
-    for label, sql in steps:
-        log_message(label)
-        start = datetime.now()
-        db.execute(sql)
-        elapsed = (datetime.now() - start).total_seconds()
-        log_message(f"  done in {elapsed:.1f}s")
-
+    rollback_to_height(target_height)
     orm.commit()
 
     total = (datetime.now() - overall_start).total_seconds()

@@ -135,5 +135,24 @@ class Block():
         return data["result"]
 
     @classmethod
+    def blockhashes(cls, start: int, end: int):
+        """Return {height: hash} for [start, end] via one batched RPC.
+
+        Heights the node cannot answer (error or null result) are left
+        out, so a result shorter than the requested range signals an
+        incomplete or failed response and must not be read as a reorg.
+        """
+        heights = list(range(start, end + 1))
+        calls = [("getblockhash", [height]) for height in heights]
+        responses = utils.make_batch_request(calls)
+
+        result = {}
+        for height, response in zip(heights, responses):
+            if response.get("error") is None and response.get("result"):
+                result[height] = response["result"]
+
+        return result
+
+    @classmethod
     def header(cls, bhash: str):
         return utils.make_request("getblockheader", [bhash])

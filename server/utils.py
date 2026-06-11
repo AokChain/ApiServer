@@ -85,6 +85,34 @@ def make_request(method, params=[]):
         return dead_response()
 
 
+def make_batch_request(calls):
+    """Send several JSON-RPC calls in a single HTTP request.
+
+    calls: a list of (method, params) tuples. Returns a list of response
+    dicts in the same order as calls (matched back by id, so the node is
+    free to reorder). On transport failure every entry is a dead_response.
+    """
+    headers = {"content-type": "text/plain;"}
+    payload = [
+        {"id": index, "method": method, "params": params}
+        for index, (method, params) in enumerate(calls)
+    ]
+    data = json.dumps(payload)
+
+    try:
+        responses = requests.post(
+            config.endpoint, headers=headers, data=data
+        ).json()
+    except Exception:
+        return [dead_response() for _ in calls]
+
+    if not isinstance(responses, list):
+        return [dead_response() for _ in calls]
+
+    by_id = {item.get("id"): item for item in responses}
+    return [by_id.get(index, dead_response()) for index in range(len(calls))]
+
+
 def reward(height):
     halvings = height // 525960
 
