@@ -19,6 +19,10 @@ from .utils import make_request
 from .models import Token
 from .models import db
 
+# `Block` above is the RPC-method class; this is the Pony entity, aliased
+# to avoid the name clash when querying the DB directly.
+from .models import Block as BlockModel
+
 
 REORG_DEPTH = 500
 
@@ -415,7 +419,7 @@ def find_reorg_height(tip_height, node_height):
     db_hashes = dict(
         orm.select(
             (b.height, b.blockhash)
-            for b in Block
+            for b in BlockModel
             if b.height >= floor and b.height <= ceiling
         )
     )
